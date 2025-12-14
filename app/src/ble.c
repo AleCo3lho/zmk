@@ -21,6 +21,10 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci_types.h>
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_PROFILE_IDENTIFIERS) && defined(CONFIG_SOC_SERIES_NRF52X)
+#include <nrfx.h>
+#endif
+
 #if IS_ENABLED(CONFIG_SETTINGS)
 
 #include <zephyr/settings/settings.h>
@@ -62,10 +66,78 @@ enum advertising_type {
 static struct zmk_ble_profile profiles[ZMK_BLE_PROFILE_COUNT];
 static uint8_t active_profile;
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_PROFILE_IDENTIFIERS)
+static char profile_device_names[ZMK_BLE_PROFILE_COUNT][CONFIG_BT_DEVICE_NAME_MAX + 1];
+static bt_addr_le_t profile_mac_addresses[ZMK_BLE_PROFILE_COUNT];
+
+static void generate_profile_device_names(void) {
+    const char *base_name = CONFIG_ZMK_KEYBOARD_NAME;
+    size_t base_len = strlen(base_name);
+
+    for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
+        // Reserve space for format string expansion (e.g., "_255" for max profile)
+        size_t reserved_space = 5; // "_255" + null terminator
+        size_t max_base_len = CONFIG_BT_DEVICE_NAME_MAX - reserved_space;
+
+        if (base_len > max_base_len) {
+            // Truncate base name if too long
+            size_t truncated_len = max_base_len;
+            snprintf(profile_device_names[i], sizeof(profile_device_names[i]),
+                     CONFIG_ZMK_BLE_PROFILE_DEVICE_NAME_FORMAT,
+                     base_name + (base_len - truncated_len), i);
+        } else {
+            snprintf(profile_device_names[i], sizeof(profile_device_names[i]),
+                     CONFIG_ZMK_BLE_PROFILE_DEVICE_NAME_FORMAT, base_name, i);
+        }
+    }
+}
+
+static void generate_profile_mac_addresses(void) {
+    // Get base MAC address
+    bt_addr_le_t base_addr;
+    bt_id_read_public_addr(0, &base_addr);
+
+    for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
+        memcpy(&profile_mac_addresses[i], &base_addr, sizeof(bt_addr_le_t));
+
+        // Generate unique controller ID from hardware
+        uint32_t controller_id = 0;
+#if defined(CONFIG_SOC_SERIES_NRF52X)
+        // Use NRF FICR device ID for uniqueness
+        controller_id = (NRF_FICR->DEVICEID[0] ^ NRF_FICR->DEVICEID[1]) & 0xFF;
+#else
+        // Fallback for other platforms - use a simple hash of device address
+        controller_id = (base_addr.a.val[0] ^ base_addr.a.val[1] ^ base_addr.a.val[2]) & 0xFF;
+#endif
+
+        // Modify last 2 bytes: [controller_id][profile_index]
+        profile_mac_addresses[i].a.val[0] = controller_id;
+        profile_mac_addresses[i].a.val[1] = i;
+
+        // Ensure it's a valid unicast address (LSB of first byte should be 0)
+        profile_mac_addresses[i].a.val[5] &= ~0x01;
+    }
+}
+
+static const char *get_profile_device_name(uint8_t profile_index) {
+    if (profile_index >= ZMK_BLE_PROFILE_COUNT) {
+        return CONFIG_BT_DEVICE_NAME;
+    }
+    return profile_device_names[profile_index];
+}
+
+static const bt_addr_le_t *get_profile_mac_address(uint8_t profile_index) {
+    if (profile_index >= ZMK_BLE_PROFILE_COUNT) {
+        return NULL;
+    }
+    return &profile_mac_addresses[profile_index];
+}
+#endif
+
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 #define DEVICE_APPEARANCE                                                                          \
-    (uint8_t) CONFIG_BT_DEVICE_APPEARANCE, (uint8_t)(CONFIG_BT_DEVICE_APPEARANCE >> 8)
+    (uint8_t)CONFIG_BT_DEVICE_APPEARANCE, (uint8_t)(CONFIG_BT_DEVICE_APPEARANCE >> 8)
 
 BUILD_ASSERT(
     DEVICE_NAME_LEN <= CONFIG_BT_DEVICE_NAME_MAX,
@@ -298,6 +370,18 @@ int zmk_ble_prof_select(uint8_t index) {
 
     active_profile = index;
     ble_save_profile();
+
+#if IS_ENABLED(CONFIG_ZMK_BLE_PROFILE_IDENTIFIERS)
+    // Update device name for new profile
+    const char *new_name = get_profile_device_name(index);
+    zmk_ble_set_device_name(new_name);
+
+    // Update MAC address for new profile
+    const bt_addr_le_t *new_mac = get_profile_mac_address(index);
+    if (new_mac) {
+        bt_id_reset(0, new_mac, NULL);
+    }
+#endif
 
     update_advertising();
 
@@ -721,6 +805,15 @@ static int zmk_ble_complete_startup(void) {
     }
 
 #endif // IS_ENABLED(CONFIG_ZMK_BLE_CLEAR_BONDS_ON_START)
+
+#if IS_ENABLED(CONFIG_ZMK_BLE_PROFILE_IDENTIFIERS)
+    generate_profile_device_names();
+    generate_profile_mac_addresses();
+
+    // Set initial profile device name
+    const char *initial_name = get_profile_device_name(active_profile);
+    zmk_ble_set_device_name(initial_name);
+#endif
 
     bt_conn_cb_register(&conn_callbacks);
     bt_conn_auth_cb_register(&zmk_ble_auth_cb_display);
