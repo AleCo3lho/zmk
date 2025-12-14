@@ -20,11 +20,6 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci_types.h>
-#include <zephyr/bluetooth/addr.h>
-
-#if IS_ENABLED(CONFIG_ZMK_BLE_PROFILE_IDENTIFIERS) && defined(CONFIG_SOC_SERIES_NRF52X)
-#include <nrfx.h>
-#endif
 
 #if IS_ENABLED(CONFIG_SETTINGS)
 
@@ -69,7 +64,6 @@ static uint8_t active_profile;
 
 #if IS_ENABLED(CONFIG_ZMK_BLE_PROFILE_IDENTIFIERS)
 static char profile_device_names[ZMK_BLE_PROFILE_COUNT][CONFIG_BT_DEVICE_NAME_MAX + 1];
-static bt_addr_le_t profile_mac_addresses[ZMK_BLE_PROFILE_COUNT];
 
 static void generate_profile_device_names(void) {
     const char *base_name = CONFIG_ZMK_KEYBOARD_NAME;
@@ -93,53 +87,11 @@ static void generate_profile_device_names(void) {
     }
 }
 
-static void generate_profile_mac_addresses(void) {
-    for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
-        // Generate unique base MAC from hardware ID (following Bluetooth best practices)
-        uint32_t id0 = 0, id1 = 0;
-
-#if defined(CONFIG_SOC_SERIES_NRF52X)
-        // Use NRF FICR device ID for hardware uniqueness
-        id0 = NRF_FICR->DEVICEID[0];
-        id1 = NRF_FICR->DEVICEID[1];
-#else
-        // Fallback: use system tick and compile time for basic uniqueness
-        id0 = k_uptime_get_32();
-        id1 = (uintptr_t)&generate_profile_mac_addresses ^ i;
-#endif
-
-        // Set address type to random static
-        profile_mac_addresses[i].type = BT_ADDR_LE_RANDOM;
-
-        // Generate base MAC address bytes
-        profile_mac_addresses[i].a.val[0] = (uint8_t)(id0 & 0xFF);
-        profile_mac_addresses[i].a.val[1] = (uint8_t)((id0 >> 8) & 0xFF);
-        profile_mac_addresses[i].a.val[2] = (uint8_t)((id0 >> 16) & 0xFF);
-        profile_mac_addresses[i].a.val[3] = (uint8_t)((id1 >> 0) & 0xFF);
-        profile_mac_addresses[i].a.val[4] = (uint8_t)((id1 >> 8) & 0xFF);
-
-        // First byte must indicate STATIC RANDOM address (C0-CF range)
-        // Use upper bits of id1 to ensure uniqueness, but stay within valid range
-        uint8_t random_part = ((id1 >> 16) & 0x0F); // 4 bits for uniqueness
-        profile_mac_addresses[i].a.val[5] = 0xC0 | random_part;
-
-        // Differentiate profiles by modifying byte 3 (following user's working approach)
-        profile_mac_addresses[i].a.val[3] = (profile_mac_addresses[i].a.val[3] & 0xF0) | (i & 0x0F);
-    }
-}
-
-static const char *get_profile_device_name(uint8_t profile_index) {
+static char *get_profile_device_name(uint8_t profile_index) {
     if (profile_index >= ZMK_BLE_PROFILE_COUNT) {
-        return CONFIG_BT_DEVICE_NAME;
+        return (char *)CONFIG_BT_DEVICE_NAME;
     }
     return profile_device_names[profile_index];
-}
-
-static bt_addr_le_t *get_profile_mac_address(uint8_t profile_index) {
-    if (profile_index >= ZMK_BLE_PROFILE_COUNT) {
-        return NULL;
-    }
-    return &profile_mac_addresses[profile_index];
 }
 #endif
 
@@ -382,24 +334,8 @@ int zmk_ble_prof_select(uint8_t index) {
 
 #if IS_ENABLED(CONFIG_ZMK_BLE_PROFILE_IDENTIFIERS)
     // Update device name for new profile
-    const char *new_name = get_profile_device_name(index);
+    char *new_name = get_profile_device_name(index);
     zmk_ble_set_device_name(new_name);
-
-    // Update MAC address for new profile
-    bt_addr_le_t *new_mac = get_profile_mac_address(index);
-    if (new_mac) {
-        int err = bt_id_delete(0);
-        if (err) {
-            LOG_WRN("Failed to delete BLE identity (err %d)", err);
-        }
-
-        err = bt_id_create(new_mac, NULL);
-        if (err) {
-            LOG_ERR("Failed to create BLE identity (err %d)", err);
-        } else {
-            LOG_DBG("Successfully switched to profile %d identity", index);
-        }
-    }
 #endif
 
     update_advertising();
@@ -827,10 +763,9 @@ static int zmk_ble_complete_startup(void) {
 
 #if IS_ENABLED(CONFIG_ZMK_BLE_PROFILE_IDENTIFIERS)
     generate_profile_device_names();
-    generate_profile_mac_addresses();
 
     // Set initial profile device name
-    const char *initial_name = get_profile_device_name(active_profile);
+    char *initial_name = get_profile_device_name(active_profile);
     zmk_ble_set_device_name(initial_name);
 #endif
 
